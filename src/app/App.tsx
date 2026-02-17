@@ -1,9 +1,12 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { TopBar } from './components/TopBar';
 import { LeftSidebar } from './components/LeftSidebar';
 import { CenterPanel } from './components/CenterPanel';
 import { RightSidebar } from './components/RightSidebar';
-import { BottomBar } from './components/BottomBar';
+import { BottomBar, type Selection } from './components/BottomBar';
+import { transcribeAudioFileInWorker } from './services/transcription';
+import mammoth from 'mammoth';
+import type { EngagementData } from './utils/engagement';
 
 interface AudioFile {
   id: string;
@@ -38,9 +41,20 @@ export default function App() {
   // Content State
   const [transcription, setTranscription] = useState('');
   const [metadata, setMetadata] = useState<Metadata | null>(null);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [selections, setSelections] = useState<Selection[]>([]);
+  const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
+  const [scriptText, setScriptText] = useState<string>('');
+  const [scriptFileName, setScriptFileName] = useState<string>('');
+  const [durationSeconds, setDurationSeconds] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcriptionOn, setTranscriptionOn] = useState(false);
+  const transcribeAbortRef = useRef(false);
+  const [totalActivePlayTimeSeconds, setTotalActivePlayTimeSeconds] = useState(0);
+  const [engagementData, setEngagementData] = useState<EngagementData | null>(null);
 
-  // Previous Uploads
-  const [previousUploads] = useState<AudioFile[]>([
+  // Previous Uploads (new uploads prepended when processed)
+  const [previousUploads, setPreviousUploads] = useState<AudioFile[]>([
     {
       id: '1',
       name: 'interview_final_v3.wav',
@@ -115,45 +129,139 @@ export default function App() {
     setCurrentFileName(file.name);
     setMetadata(null);
     setTranscription('');
-    
+    setPlaybackTime(0);
+    setSelections([]);
+    setTranscriptionError(null);
+    setScriptText('');
+    setScriptFileName('');
+
     // Parse filename for top bar info
     parseFilename(file.name);
 
-    // Simulate processing
-    setTimeout(() => {
+    // Process metadata immediately (non-blocking), then transcription in background
+    try {
+      const qcStatus: 'pass' | 'fail' = Math.random() > 0.3 ? 'pass' : 'fail';
       const mockMetadata: Metadata = {
         fileSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
         duration: '00:03:24.567',
         format: file.name.split('.').pop()?.toUpperCase() || 'UNKNOWN',
         codec: getCodecForFormat(file.name),
-        voaStatus: Math.random() > 0.3 ? 'pass' : 'fail',
+        voaStatus: qcStatus,
         bitrate: '320 kbps',
         sampleRate: '48 kHz',
         channels: 'Stereo (2)',
       };
       setMetadata(mockMetadata);
 
-      // Generate mock transcription
-      const mockTranscription = `[00:00.000] Hello and welcome to today's audio production quality control session. This is a test recording designed to demonstrate the capabilities of our QC portal.
+      const now = new Date();
+      const ts = now.toTimeString().slice(0, 8);
+      setPreviousUploads((prev) => [
+        { id: `upload-${Date.now()}`, name: file.name, timestamp: ts, status: qcStatus },
+        ...prev,
+      ]);
 
-[00:15.234] The system performs real-time analysis of audio characteristics including bitrate, sample rate, codec validation, and VOA compliance standards.
-
-[00:32.567] Our automated transcription service provides millisecond-accurate timestamps for every spoken segment, making it easier to identify and correct issues during post-production.
-
-[01:02.891] Technical specifications are validated against industry standards to ensure broadcast-ready output. The portal supports multiple audio formats including WAV, MP3, FLAC, AAC, and OGG.
-
-[01:45.123] Quality assurance metrics include signal-to-noise ratio, dynamic range analysis, peak level detection, and frequency response validation.
-
-[02:18.456] Thank you for using the Audio Production QC Portal. This concludes the demonstration transcript.`;
-
-      setTranscription(mockTranscription);
+      // Finish processing immediately so playback works
       setIsProcessing(false);
-    }, 2000);
+
+      // No auto-transcription: user clicks Transcribe to get what's actually in the audio
+      setTranscription('');
+      setTranscriptionError(null);
+    } catch (e) {
+      setIsProcessing(false);
+      setTranscriptionError('Failed to process file. Please try again.');
+    }
+  };
+
+  const runTranscription = async () => {
+    if (!currentFile || isTranscribing) return;
+    transcribeAbortRef.current = false;
+    setIsTranscribing(true);
+    setTranscriptionError(null);
+    try {
+      const transcript = await transcribeAudioFileInWorker(currentFile);
+      if (!transcribeAbortRef.current) {
+        setTranscription(transcript);
+        setTranscriptionError(null);
+      }
+      } catch (e) {
+        if (!transcribeAbortRef.current) {
+          const errorMsg = e instanceof Error ? e.message : 'Unknown error';
+          setTranscriptionError(errorMsg);
+        setTranscription(
+          '[00:00.000] Transcription unavailable. Turn off and on again or try a shorter file.\n\n[00:05.000] You can still use markers and review the waveform.'
+        );
+      }
+    } finally {
+      if (!transcribeAbortRef.current) setIsTranscribing(false);
+    }
+  };
+
+  // When toggle is ON and we have a file, run transcription in background (deferred so UI shows loading first)
+  useEffect(() => {
+    if (!currentFile || !transcriptionOn) return;
+    let cancelled = false;
+    transcribeAbortRef.current = false;
+
+    setIsTranscribing(true);
+    setTranscriptionError(null);
+
+    const runAsync = async () => {
+      try {
+        const transcript = await transcribeAudioFileInWorker(currentFile);
+        if (!cancelled && !transcribeAbortRef.current) {
+          setTranscription(transcript);
+          setTranscriptionError(null);
+        }
+      } catch (e) {
+        if (!cancelled && !transcribeAbortRef.current) {
+          const msg = e instanceof Error ? e.message : 'Unknown error';
+          setTranscriptionError(msg);
+          setTranscription(
+            '[00:00.000] Transcription failed.\n\n[00:05.000] You can still use markers and review the waveform.'
+          );
+        }
+      } finally {
+        if (!cancelled) setIsTranscribing(false);
+      }
+    };
+
+    const timeoutId = setTimeout(runAsync, 0);
+    return () => {
+      cancelled = true;
+      transcribeAbortRef.current = true;
+      clearTimeout(timeoutId);
+      setIsTranscribing(false);
+    };
+  }, [currentFile, transcriptionOn]);
+
+  const handleScriptSelect = async (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    if (ext === 'docx') {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        setScriptText(result.value);
+        setScriptFileName(file.name);
+      } catch (e) {
+        setScriptText('');
+        setScriptFileName('');
+      }
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = (reader.result as string) || '';
+        setScriptText(text);
+        setScriptFileName(file.name);
+      };
+      reader.readAsText(file);
+    }
   };
 
   const handleFileClick = (file: AudioFile) => {
     setSelectedFileId(file.id);
     setCurrentFile(null);
+    setPlaybackTime(0);
+    setSelections([]);
     const mockMetadata: Metadata = {
       fileSize: `${(Math.random() * 50 + 10).toFixed(2)} MB`,
       duration: '00:04:32.123',
@@ -166,6 +274,10 @@ export default function App() {
     };
     setMetadata(mockMetadata);
     setTranscription('[Historical transcription data would be loaded here for previously analyzed files.]');
+  };
+
+  const handleAddSelection = (selection: Selection) => {
+    setSelections((prev) => [...prev, selection]);
   };
 
   const getCodecForFormat = (filename: string): string => {
@@ -196,17 +308,31 @@ export default function App() {
         <div className="w-80 flex-shrink-0">
           <LeftSidebar
             onFileSelect={handleFileSelect}
+            onScriptSelect={handleScriptSelect}
             previousUploads={previousUploads}
             selectedFileId={selectedFileId}
             onFileClick={handleFileClick}
             isProcessing={isProcessing}
             currentFileName={currentFileName}
+            scriptFileName={scriptFileName}
           />
         </div>
 
-        {/* Center Panel - Red */}
+        {/* Center Panel - Transcription with live scroll */}
         <div className="flex-1">
-          <CenterPanel transcription={transcription} />
+          <CenterPanel
+            transcription={transcription}
+            playbackTime={playbackTime}
+            scriptText={scriptText}
+            scriptFileName={scriptFileName}
+            durationSeconds={durationSeconds}
+            selections={selections}
+            error={transcriptionError}
+            transcriptionOn={transcriptionOn}
+            onTranscriptionToggle={() => setTranscriptionOn((on) => !on)}
+            isTranscribing={isTranscribing}
+            canTranscribe={!!currentFile}
+          />
         </div>
 
         {/* Right Sidebar - Green */}
@@ -215,9 +341,20 @@ export default function App() {
         </div>
       </div>
 
-      {/* Bottom Bar - Pink */}
+      {/* Bottom Bar - Waveform + centered controls */}
       <div className="flex-shrink-0">
-        <BottomBar audioFile={currentFile} />
+        <BottomBar
+          audioFile={currentFile}
+          onTimeUpdate={setPlaybackTime}
+          onDurationChange={setDurationSeconds}
+          onTotalActivePlayTimeChange={setTotalActivePlayTimeSeconds}
+          onEngagementDataChange={(data) => {
+            setEngagementData(data);
+            // Persistence: payload ready to POST to backend, e.g. buildEngagementPayload(data)
+          }}
+          selections={selections}
+          onAddSelection={handleAddSelection}
+        />
       </div>
     </div>
   );
