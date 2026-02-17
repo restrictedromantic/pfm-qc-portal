@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import WaveSurfer from 'wavesurfer.js';
+import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
 import { Play, Pause, SkipBack, SkipForward, Volume2, ChevronDown, ChevronUp, PenTool } from 'lucide-react';
 import {
   type EngagementLogEntry,
@@ -7,10 +8,41 @@ import {
   computeUniqueSecondsPlayed,
   computeListenerScore,
 } from '../utils/engagement';
+import { useSystemConsole } from '../context/SystemConsoleContext';
 
 const SKIP_5 = 5;
 const SKIP_10 = 10;
 const PLAY_SAMPLE_INTERVAL_MS = 5000;
+
+/** Draw a mock sine waveform into the container when real load fails – proves container is visible */
+function drawMockWaveform(container: HTMLElement | null) {
+  if (!container) return;
+  const width = Math.max(container.offsetWidth || 400, 400);
+  const height = Math.max(container.offsetHeight || 128, 128);
+  container.innerHTML = '';
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  canvas.style.display = 'block';
+  container.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = '#ec4899';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  const midY = height / 2;
+  for (let x = 0; x <= width; x += 2) {
+    const t = (x / width) * Math.PI * 8;
+    const y = midY + Math.sin(t) * (height * 0.35);
+    if (x === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
 
 export interface Selection {
   id: string;
@@ -39,20 +71,36 @@ interface BottomBarProps {
   onEngagementDataChange?: (data: EngagementData) => void;
   selections?: Selection[];
   onAddSelection?: (selection: Selection) => void;
+  /** When a region is resized or moved, sync Start/End to CreativeQCLog (id = selection id, start/end in seconds) */
+  onSelectionUpdate?: (id: string, params: { start: number; end: number }) => void;
 }
 
-export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalActivePlayTimeChange, onEngagementDataChange, selections = [], onAddSelection }: BottomBarProps) {
+export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalActivePlayTimeChange, onEngagementDataChange, selections = [], onAddSelection, onSelectionUpdate }: BottomBarProps) {
+  const { systemLog } = useSystemConsole();
+  const systemLogRef = useRef(systemLog);
+  systemLogRef.current = systemLog;
+
   const waveformRef = useRef<HTMLDivElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
+  const regionsPluginRef = useRef<InstanceType<typeof RegionsPlugin> | null>(null);
+  const disableDragSelectionRef = useRef<(() => void) | null>(null);
   const objectUrlRef = useRef<string | null>(null);
+  const isDraggingRef = useRef(false);
+  const dragStartRef = useRef<number | null>(null);
+  const dragEndRef = useRef<number | null>(null);
+  const mockDrawnRef = useRef(false);
   const onTimeUpdateRef = useRef(onTimeUpdate);
   const onDurationChangeRef = useRef(onDurationChange);
   const onTotalActivePlayTimeChangeRef = useRef(onTotalActivePlayTimeChange);
   const onEngagementDataChangeRef = useRef(onEngagementDataChange);
+  const onAddSelectionRef = useRef(onAddSelection);
+  const onSelectionUpdateRef = useRef(onSelectionUpdate);
   onTimeUpdateRef.current = onTimeUpdate;
   onDurationChangeRef.current = onDurationChange;
   onTotalActivePlayTimeChangeRef.current = onTotalActivePlayTimeChange;
   onEngagementDataChangeRef.current = onEngagementDataChange;
+  onAddSelectionRef.current = onAddSelection;
+  onSelectionUpdateRef.current = onSelectionUpdate;
   const [isPlaying, setIsPlaying] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [currentTime, setCurrentTime] = useState('00:00.000');
@@ -72,11 +120,17 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
   const [engagementLogs, setEngagementLogs] = useState<EngagementLogEntry[]>([]);
   const playSampleIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Custom drag selection state
-  const isDraggingRef = useRef(false);
-  const dragStartRef = useRef<number | null>(null);
-  const dragEndRef = useRef<number | null>(null);
-  const selectionOverlayRef = useRef<HTMLDivElement | null>(null);
+  // Smart magnifier: locked start on first click, live end during drag
+  const [magnifierLockedStart, setMagnifierLockedStart] = useState<number | null>(null);
+  const [dragEndTime, setDragEndTime] = useState<number | null>(null);
+  const isMagnifierDragRef = useRef(false);
+
+  // Hover magnify: ±5s zoomed view for precise marker placement
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
+  const waveformWrapperRef = useRef<HTMLDivElement>(null);
+  const magnifierRef = useRef<HTMLDivElement>(null);
+  const magnifierWsRef = useRef<WaveSurfer | null>(null);
+  const magnifierScrollRef = useRef<HTMLDivElement | null>(null);
 
   const pushEngagementLog = (entry: Omit<EngagementLogEntry, 'timestamp'>) => {
     setEngagementLogs((prev) => {
@@ -88,18 +142,38 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
   useEffect(() => {
     if (waveformRef.current && !wavesurferRef.current) {
       try {
-        // MediaElement backend uses HTML5 audio - reliable play/pause and seeker sync
+        const regionsPlugin = RegionsPlugin.create();
+        regionsPluginRef.current = regionsPlugin;
+
+        regionsPlugin.on('region-created', (region) => {
+          pushEngagementLog({ type: 'mark', playbackTime: (region.start + region.end) / 2 });
+          onAddSelectionRef.current?.({
+            id: region.id,
+            start: region.start,
+            end: region.end,
+            color: region.color,
+          });
+          // Update CreativeQCLog only when drag/resize ends (not during)
+          region.on('update-end', () => {
+            onSelectionUpdateRef.current?.(region.id, { start: region.start, end: region.end });
+          });
+        });
+
+        // Main-thread only: MediaElement backend (no Web Worker decode); no pre-computed peaks
         wavesurferRef.current = WaveSurfer.create({
           container: waveformRef.current,
           waveColor: '#831843',
           progressColor: '#ec4899',
           cursorColor: '#f9a8d4',
-          barWidth: 3,
-          barGap: 1,
-          barRadius: 3,
-          height: 72,
+          barWidth: 2,
+          barGap: 0,
+          barRadius: 1,
+          height: 128,
           normalize: true,
           backend: 'MediaElement',
+          minPxPerSec: 20,
+          plugins: [regionsPlugin],
+          sampleRate: 8000,
         });
 
         wavesurferRef.current.on('play', () => {
@@ -129,16 +203,20 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
         });
 
         wavesurferRef.current.on('ready', () => {
+          mockDrawnRef.current = false;
           const dur = wavesurferRef.current?.getDuration() ?? 0;
           setDuration(formatTime(dur));
           setDurationSeconds(dur);
           onDurationChangeRef.current?.(dur);
           setIsReady(true);
+          systemLogRef.current?.('Region Plugin Initialization', 'milestone', 'success');
         });
 
         wavesurferRef.current.on('load', () => {
           setIsReady(false);
           setMarkingMode(false);
+          setMagnifierLockedStart(null);
+          setDragEndTime(null);
           setTotalActivePlayTime(0);
           onTotalActivePlayTimeChangeRef.current?.(0);
           setPlaySegments([]);
@@ -150,6 +228,9 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
 
         wavesurferRef.current.on('error', () => {
           setIsReady(false);
+          systemLogRef.current?.('WaveSurfer error – showing mock waveform', 'error', 'error');
+          mockDrawnRef.current = true;
+          drawMockWaveform(waveformRef.current);
         });
       } catch {
         // WaveSurfer init failed; component may unmount or retry
@@ -157,6 +238,8 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
     }
 
     return () => {
+      disableDragSelectionRef.current?.();
+      disableDragSelectionRef.current = null;
       if (wavesurferRef.current) {
         try {
           wavesurferRef.current.destroy();
@@ -165,6 +248,7 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
         }
         wavesurferRef.current = null;
       }
+      regionsPluginRef.current = null;
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = null;
@@ -191,13 +275,27 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
     onTotalActivePlayTimeChangeRef.current?.(0);
     setMarkingMode(false);
 
+    // Always load local file / blob URL when present (Offline mode does not skip – waveform always uses local source)
     if (audioFile) {
+      if (mockDrawnRef.current && waveformRef.current) {
+        waveformRef.current.innerHTML = '';
+        mockDrawnRef.current = false;
+      }
       try {
         const url = URL.createObjectURL(audioFile);
         objectUrlRef.current = url;
-        wavesurferRef.current.load(url);
-      } catch {
+        console.log('BLOB URL CREATED:', url);
+        systemLogRef.current?.('BLOB URL CREATED: ' + url, 'log');
+        wavesurferRef.current.load(url).catch((err) => {
+          systemLogRef.current?.(`WaveSurfer load failed: ${err instanceof Error ? err.message : String(err)} – showing mock waveform`, 'error', 'error');
+          mockDrawnRef.current = true;
+          drawMockWaveform(waveformRef.current);
+        });
+      } catch (e) {
         setIsReady(false);
+        systemLogRef.current?.(`Blob URL creation failed: ${e instanceof Error ? e.message : String(e)}`, 'error', 'error');
+        mockDrawnRef.current = true;
+        drawMockWaveform(waveformRef.current);
       }
     }
   }, [audioFile]);
@@ -207,6 +305,69 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
       wavesurferRef.current.setVolume(volume);
     }
   }, [volume]);
+
+  // Sync selections to Regions plugin: update existing regions in place (setOptions) so positions stay locked to timeline; only add/remove when needed
+  useEffect(() => {
+    const regionsPlugin = regionsPluginRef.current;
+    const ws = wavesurferRef.current;
+    if (!regionsPlugin || !ws || !isReady || durationSeconds <= 0) return;
+    const existing = regionsPlugin.getRegions();
+    const selectionIds = new Set(selections.map((s) => s.id));
+    existing.forEach((region) => {
+      if (!selectionIds.has(region.id)) region.remove();
+    });
+    selections.forEach((sel) => {
+      const existingRegion = regionsPlugin.getRegions().find((r) => r.id === sel.id);
+      if (existingRegion) {
+        existingRegion.setOptions({ start: sel.start, end: sel.end });
+      } else {
+        const region = regionsPlugin.addRegion({
+          id: sel.id,
+          start: sel.start,
+          end: sel.end,
+          color: sel.color,
+          drag: true,
+          resize: true,
+          resizeStart: true,
+          resizeEnd: true,
+          minLength: 0.1,
+        });
+        region.on('update-end', () => {
+          onSelectionUpdateRef.current?.(region.id, { start: region.start, end: region.end });
+        });
+      }
+    });
+  }, [selections, isReady, durationSeconds]);
+
+  // When marking mode turns off, clear magnifier lock
+  useEffect(() => {
+    if (!markingMode) {
+      setMagnifierLockedStart(null);
+      setDragEndTime(null);
+    }
+  }, [markingMode]);
+
+  // When marking mode is on, enable drag-to-create region; when off, disable
+  useEffect(() => {
+    disableDragSelectionRef.current?.();
+    disableDragSelectionRef.current = null;
+    const regions = regionsPluginRef.current;
+    if (!regions || !markingMode || !isReady) return;
+    const nextColor = SELECTION_COLORS[selections.length % SELECTION_COLORS.length];
+    disableDragSelectionRef.current = regions.enableDragSelection(
+      {
+        id: `sel-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        color: nextColor,
+        drag: true,
+        resize: true,
+      },
+      5
+    );
+    return () => {
+      disableDragSelectionRef.current?.();
+      disableDragSelectionRef.current = null;
+    };
+  }, [markingMode, isReady, selections.length]);
 
   // Every 5s of active playback, push currentTime into playSegments
   useEffect(() => {
@@ -280,121 +441,145 @@ export function BottomBar({ audioFile, onTimeUpdate, onDurationChange, onTotalAc
     return percent * durationSeconds;
   };
 
-  // Custom drag selection handlers - only attach when marking mode is active
-  useEffect(() => {
-    if (!markingMode || !isReady || !waveformRef.current || !wavesurferRef.current || !durationSeconds) {
-      // Clean up if marking mode is off
-      isDraggingRef.current = false;
-      dragStartRef.current = null;
-      dragEndRef.current = null;
-      return;
-    }
+  const MAGNIFY_WINDOW_SEC = 10; // ±5s = 10s total
+  const MAGNIFIER_WIDTH_PX = 280;
 
-    // Use the parent container, not the waveform div itself (which WaveSurfer controls)
-    const container = waveformRef.current.parentElement;
-    if (!container) return;
+  // Create magnifier WaveSurfer when main waveform is ready (same audio, zoomed to 10s)
+  useEffect(() => {
+    if (!isReady || !magnifierRef.current || !objectUrlRef.current || !durationSeconds) return;
+    const url = objectUrlRef.current;
+    let mounted = true;
+    const ws = WaveSurfer.create({
+      container: magnifierRef.current,
+      waveColor: '#831843',
+      progressColor: '#ec4899',
+      cursorColor: 'transparent',
+      barWidth: 2,
+      barGap: 0,
+      barRadius: 1,
+      height: 56,
+      normalize: true,
+      backend: 'MediaElement',
+      minPxPerSec: MAGNIFIER_WIDTH_PX / MAGNIFY_WINDOW_SEC,
+      interact: false,
+    });
+    magnifierWsRef.current = ws;
+    ws.load(url).then(() => {
+      if (!mounted || !magnifierRef.current) return;
+      const container = magnifierRef.current;
+      const scrollEl = container.querySelector('[style*="overflow"]') as HTMLElement
+        ?? (container.firstElementChild as HTMLElement)
+        ?? container;
+      magnifierScrollRef.current = scrollEl;
+    });
+    return () => {
+      mounted = false;
+      try { ws.destroy(); } catch { /* noop */ }
+      magnifierWsRef.current = null;
+      magnifierScrollRef.current = null;
+    };
+  }, [isReady, durationSeconds]);
+
+  // Magnifier scroll: center on locked start (first click) or hover time
+  const magnifierCenter = magnifierLockedStart ?? hoverTime ?? 0;
+  useEffect(() => {
+    if (!magnifierScrollRef.current || !durationSeconds) return;
+    const center = Math.max(5, Math.min(durationSeconds - 5, magnifierCenter));
+    const startSec = center - 5;
+    const pxPerSec = MAGNIFIER_WIDTH_PX / MAGNIFY_WINDOW_SEC;
+    const scrollLeft = Math.max(0, startSec * pxPerSec);
+    magnifierScrollRef.current.scrollLeft = scrollLeft;
+  }, [magnifierCenter, durationSeconds]);
+
+  // Smart magnifier: on first click lock start; during drag show end live
+  useEffect(() => {
+    const container = waveformWrapperRef.current;
+    if (!container || !durationSeconds) return;
 
     const handleMouseDown = (e: MouseEvent) => {
-      // Only start drag if clicking on the waveform area (not on controls)
       const target = e.target as HTMLElement;
-      if (target.closest('button') || target.closest('.selection-overlay')) return;
-      
-      isDraggingRef.current = true;
+      if (target.closest('button')) return;
       const rect = container.getBoundingClientRect();
       const x = e.clientX - rect.left;
-      dragStartRef.current = pixelToTime(x, rect.width);
-      dragEndRef.current = dragStartRef.current;
-      
-      // Show overlay
-      if (selectionOverlayRef.current) {
-        selectionOverlayRef.current.style.display = 'block';
+      const t = pixelToTime(x, rect.width);
+      if (markingMode) {
+        setMagnifierLockedStart(t);
+        isMagnifierDragRef.current = true;
       }
     };
 
     const handleMouseMove = (e: MouseEvent) => {
-      if (!isDraggingRef.current || dragStartRef.current === null) return;
+      if (!isMagnifierDragRef.current) return;
       const rect = container.getBoundingClientRect();
       const x = e.clientX - rect.left;
-      dragEndRef.current = pixelToTime(x, rect.width);
-      
-      // Update visual overlay
-      if (selectionOverlayRef.current && dragStartRef.current !== null && dragEndRef.current !== null) {
-        const start = Math.min(dragStartRef.current, dragEndRef.current);
-        const end = Math.max(dragStartRef.current, dragEndRef.current);
-        const leftPercent = (start / durationSeconds) * 100;
-        const widthPercent = ((end - start) / durationSeconds) * 100;
-        selectionOverlayRef.current.style.left = `${leftPercent}%`;
-        selectionOverlayRef.current.style.width = `${widthPercent}%`;
-      }
+      setDragEndTime(pixelToTime(x, rect.width));
     };
 
     const handleMouseUp = () => {
-      if (!isDraggingRef.current || dragStartRef.current === null || dragEndRef.current === null) return;
-      
-      const start = Math.min(dragStartRef.current, dragEndRef.current);
-      const end = Math.max(dragStartRef.current, dragEndRef.current);
-      
-      if (end - start > 0.1 && onAddSelection) {
-        const colorIndex = selections.length % SELECTION_COLORS.length;
-        const color = SELECTION_COLORS[colorIndex];
-        const selection: Selection = {
-          id: `sel-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          start,
-          end,
-          color,
-        };
-        pushEngagementLog({ type: 'mark', playbackTime: (start + end) / 2 });
-        onAddSelection(selection);
-      }
-      
-      isDraggingRef.current = false;
-      dragStartRef.current = null;
-      dragEndRef.current = null;
-      if (selectionOverlayRef.current) {
-        selectionOverlayRef.current.style.display = 'none';
-      }
+      isMagnifierDragRef.current = false;
+      setMagnifierLockedStart(null);
+      setDragEndTime(null);
     };
 
-    container.addEventListener('mousedown', handleMouseDown, { passive: true });
-    document.addEventListener('mousemove', handleMouseMove, { passive: true });
-    document.addEventListener('mouseup', handleMouseUp, { passive: true });
-
+    container.addEventListener('mousedown', handleMouseDown);
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
     return () => {
       container.removeEventListener('mousedown', handleMouseDown);
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [markingMode, isReady, durationSeconds, selections.length, onAddSelection]);
+  }, [markingMode, durationSeconds]);
+
+  const handleWaveformMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const el = waveformWrapperRef.current;
+    if (!el || !durationSeconds) return;
+    const rect = el.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const t = pixelToTime(x, rect.width);
+    setHoverTime(t);
+  };
+
+  const handleWaveformMouseLeave = () => setHoverTime(null);
+
+  const magnifierStart = magnifierCenter > 0 ? Math.max(0, magnifierCenter - 5) : 0;
+  const magnifierEnd = magnifierCenter > 0 ? Math.min(durationSeconds, magnifierCenter + 5) : 0;
+  const showMagnifier = (hoverTime != null || magnifierLockedStart != null) && isReady && durationSeconds > 0;
 
   return (
     <div className="bg-[var(--qc-panel)] border-t border-[var(--qc-panel-border)] px-6 py-3 flex flex-col gap-3">
-      {/* Waveform row - timestamp inside, custom drag selection */}
+      {/* Pro waveform row + hover magnify */}
       <div
-        className={`w-full min-h-[72px] rounded overflow-hidden bg-black/20 relative ${
+        ref={waveformWrapperRef}
+        onMouseMove={handleWaveformMouseMove}
+        onMouseLeave={handleWaveformMouseLeave}
+        className={`w-full min-h-[128px] rounded overflow-visible bg-black/20 relative ${
           markingMode ? 'cursor-crosshair' : ''
         }`}
+        style={{ minHeight: 128 }}
       >
-        <div ref={waveformRef} className="w-full h-full" />
-        {/* Selection overlays */}
-        {durationSeconds > 0 && selections.map((sel) => (
-          <div
-            key={sel.id}
-            className="absolute top-0 bottom-0 pointer-events-none z-10"
-            style={{
-              left: `${(sel.start / durationSeconds) * 100}%`,
-              width: `${((sel.end - sel.start) / durationSeconds) * 100}%`,
-              backgroundColor: sel.color,
-            }}
-          />
-        ))}
-        {/* Temporary drag overlay */}
-        {markingMode && (
-          <div
-            ref={selectionOverlayRef}
-            className="absolute top-0 bottom-0 pointer-events-none z-10"
-            style={{ display: 'none', backgroundColor: SELECTION_COLORS[selections.length % SELECTION_COLORS.length] }}
-          />
-        )}
+        <div ref={waveformRef} className="w-full h-full min-h-[128px]" style={{ minHeight: 128, width: '100%' }} />
+        {/* Smart magnifier: hover = timestamp; first click = lock Start; during drag = live End */}
+        <div
+          className={`absolute z-30 bottom-full left-1/2 -translate-x-1/2 mb-2 w-[280px] rounded-lg border border-white/30 bg-black/95 shadow-xl overflow-hidden pointer-events-none transition-opacity ${
+            showMagnifier ? 'opacity-100' : 'opacity-0'
+          }`}
+          style={{ height: 72 }}
+        >
+          <div className="absolute top-0 left-0 right-0 px-2 py-1 text-[10px] text-white/80 font-mono bg-black/50 flex flex-col gap-0.5">
+            {magnifierLockedStart != null && (
+              <span>Start: {formatTime(magnifierLockedStart)}</span>
+            )}
+            {dragEndTime != null && (
+              <span>End: {formatTime(dragEndTime)}</span>
+            )}
+            {hoverTime != null && magnifierLockedStart == null && dragEndTime == null && (
+              <span>Time: {formatTime(hoverTime)}</span>
+            )}
+            <span>{formatTime(magnifierStart)} → {formatTime(magnifierEnd)}</span>
+          </div>
+          <div ref={magnifierRef} className="absolute inset-0 top-8 w-full h-[56px]" />
+        </div>
         {/* Timestamp inside waveform window */}
         <div
           className="absolute bottom-1 left-2 text-xs text-white/80 font-mono pointer-events-none z-20"

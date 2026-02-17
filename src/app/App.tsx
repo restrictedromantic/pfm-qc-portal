@@ -2,11 +2,16 @@ import React, { useState, useEffect, useRef } from 'react';
 import { TopBar } from './components/TopBar';
 import { LeftSidebar } from './components/LeftSidebar';
 import { CenterPanel } from './components/CenterPanel';
-import { RightSidebar } from './components/RightSidebar';
+import { CreativeQCLog, type CreativeQCLogEntry } from './components/CreativeQCLog';
 import { BottomBar, type Selection } from './components/BottomBar';
+import { SystemConsole } from './components/SystemConsole';
+import { useSystemConsole } from './context/SystemConsoleContext';
 import { transcribeAudioFileInWorker } from './services/transcription';
 import mammoth from 'mammoth';
 import type { EngagementData } from './utils/engagement';
+import { formatTimecodeMMSS } from './utils/timecode';
+
+const SUPABASE_OFFLINE_TIMEOUT_MS = 3000;
 
 interface AudioFile {
   id: string;
@@ -27,6 +32,8 @@ interface Metadata {
 }
 
 export default function App() {
+  const { systemLog, clear: clearConsole } = useSystemConsole();
+
   // Top Bar State (parsed from filename)
   const [showName, setShowName] = useState('');
   const [episodeNumber, setEpisodeNumber] = useState('');
@@ -52,6 +59,7 @@ export default function App() {
   const transcribeAbortRef = useRef(false);
   const [totalActivePlayTimeSeconds, setTotalActivePlayTimeSeconds] = useState(0);
   const [engagementData, setEngagementData] = useState<EngagementData | null>(null);
+  const [creativeQCLogEntries, setCreativeQCLogEntries] = useState<CreativeQCLogEntry[]>([]);
 
   // Previous Uploads (new uploads prepended when processed)
   const [previousUploads, setPreviousUploads] = useState<AudioFile[]>([
@@ -123,6 +131,10 @@ export default function App() {
   };
 
   const handleFileSelect = (file: File) => {
+    clearConsole();
+    systemLog('Upload Triggered', 'milestone', 'processing');
+
+    systemLog(`File passed to BottomBar: ${file.name}, size: ${file.size} bytes`, 'log');
     setCurrentFile(file);
     setSelectedFileId(null);
     setIsProcessing(true);
@@ -131,14 +143,13 @@ export default function App() {
     setTranscription('');
     setPlaybackTime(0);
     setSelections([]);
+    setCreativeQCLogEntries([]);
     setTranscriptionError(null);
     setScriptText('');
     setScriptFileName('');
 
-    // Parse filename for top bar info
     parseFilename(file.name);
 
-    // Process metadata immediately (non-blocking), then transcription in background
     try {
       const qcStatus: 'pass' | 'fail' = Math.random() > 0.3 ? 'pass' : 'fail';
       const mockMetadata: Metadata = {
@@ -160,15 +171,33 @@ export default function App() {
         ...prev,
       ]);
 
-      // Finish processing immediately so playback works
-      setIsProcessing(false);
-
-      // No auto-transcription: user clicks Transcribe to get what's actually in the audio
       setTranscription('');
       setTranscriptionError(null);
-    } catch (e) {
+
+      systemLog('File locally processed', 'milestone', 'success');
+
+      // Unblock UI immediately so the player works (Offline Mode: never wait on backend)
       setIsProcessing(false);
+
+      // Backend attempt in background – never blocks; log only
+      systemLog('Supabase Connection Attempt', 'milestone', 'processing');
+      const offlineTimer = setTimeout(() => {
+        systemLog('Offline mode – backend unavailable or skipped; player ready', 'milestone', 'success');
+      }, SUPABASE_OFFLINE_TIMEOUT_MS);
+      (async () => {
+        try {
+          // Future: await supabase.storage.upload(...); clearTimeout(offlineTimer) on success
+          clearTimeout(offlineTimer);
+          systemLog('Offline mode – no backend configured; player ready', 'milestone', 'success');
+        } catch (e) {
+          clearTimeout(offlineTimer);
+          systemLog(`Backend error: ${e instanceof Error ? e.message : 'Unknown'} – using offline mode`, 'milestone', 'error');
+        }
+      })();
+    } catch (e) {
+      systemLog(`File processing error: ${e instanceof Error ? e.message : 'Unknown'}`, 'error', 'error');
       setTranscriptionError('Failed to process file. Please try again.');
+      setIsProcessing(false);
     }
   };
 
@@ -277,7 +306,46 @@ export default function App() {
   };
 
   const handleAddSelection = (selection: Selection) => {
-    setSelections((prev) => [...prev, selection]);
+    setSelections((prev) => {
+      if (prev.some((s) => s.id === selection.id)) return prev;
+      return [...prev, selection];
+    });
+    setCreativeQCLogEntries((prev) => {
+      const logId = `qc-${selection.id}`;
+      if (prev.some((e) => e.id === logId)) return prev;
+      return [
+        ...prev,
+        {
+          id: logId,
+          startTimecode: formatTimecodeMMSS(selection.start),
+          endTimecode: formatTimecodeMMSS(selection.end),
+          category: 'Dialogue',
+          urgency: 'Can be fixed',
+          feedback: '',
+          color: selection.color,
+        },
+      ];
+    });
+  };
+
+  const handleUpdateCreativeQCEntry = (id: string, patch: Partial<Omit<CreativeQCLogEntry, 'id' | 'color'>>) => {
+    setCreativeQCLogEntries((prev) =>
+      prev.map((e) => (e.id === id ? { ...e, ...patch } : e))
+    );
+  };
+
+  const handleSelectionUpdate = (selectionId: string, params: { start: number; end: number }) => {
+    setSelections((prev) =>
+      prev.map((s) => (s.id === selectionId ? { ...s, start: params.start, end: params.end } : s))
+    );
+    const logId = `qc-${selectionId}`;
+    setCreativeQCLogEntries((prev) =>
+      prev.map((e) =>
+        e.id === logId
+          ? { ...e, startTimecode: formatTimecodeMMSS(params.start), endTimecode: formatTimecodeMMSS(params.end) }
+          : e
+      )
+    );
   };
 
   const getCodecForFormat = (filename: string): string => {
@@ -315,6 +383,7 @@ export default function App() {
             isProcessing={isProcessing}
             currentFileName={currentFileName}
             scriptFileName={scriptFileName}
+            metadata={metadata}
           />
         </div>
 
@@ -335,9 +404,9 @@ export default function App() {
           />
         </div>
 
-        {/* Right Sidebar - Green */}
+        {/* Right: Creative QC Log – keyed by file so it stays in sync with the current waveform */}
         <div className="w-96 flex-shrink-0">
-          <RightSidebar metadata={metadata} />
+          <CreativeQCLog key={currentFileName || 'no-file'} entries={creativeQCLogEntries} onUpdateEntry={handleUpdateCreativeQCEntry} />
         </div>
       </div>
 
@@ -350,12 +419,15 @@ export default function App() {
           onTotalActivePlayTimeChange={setTotalActivePlayTimeSeconds}
           onEngagementDataChange={(data) => {
             setEngagementData(data);
-            // Persistence: payload ready to POST to backend, e.g. buildEngagementPayload(data)
           }}
           selections={selections}
           onAddSelection={handleAddSelection}
+          onSelectionUpdate={handleSelectionUpdate}
         />
       </div>
+
+      {/* Backend Status Console – collapsible, captures console + milestones */}
+      <SystemConsole />
     </div>
   );
 }

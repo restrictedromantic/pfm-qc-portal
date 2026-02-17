@@ -5,6 +5,88 @@
 
 import type { EngagementLogEntry } from '../app/utils/engagement';
 
+/** Per-pillar episode progress: current count / total (e.g. 15/50). Each pillar is independent. */
+export type PillarProgress = { current: number; total: number };
+
+/** Production status per show: one progress object per pillar. No derived/auto-moving logic. */
+export type ShowStatus = {
+  scripting: PillarProgress;
+  raw: PillarProgress;
+  mastering: PillarProgress;
+  creativeQC: PillarProgress;
+  technicalQC: PillarProgress;
+};
+
+export type PillarKey = keyof ShowStatus;
+
+/** One row in the Production Status Matrix: show name, status per pillar, and which pillar is active (for live pulse). */
+export interface ProductionStatusRow {
+  id: string;
+  showName: string;
+  status: ShowStatus;
+  /** Pillar being worked on right now (from recent activity logs); null if none. */
+  activePillar: PillarKey | null;
+}
+
+export const PILLAR_LABELS: Record<PillarKey, string> = {
+  scripting: 'Scripting',
+  raw: 'Raw',
+  mastering: 'Mastering',
+  creativeQC: 'Creative QC',
+  technicalQC: 'Technical QC',
+};
+
+export const mockProductionStatusRows: ProductionStatusRow[] = [
+  {
+    id: 'ps-1',
+    showName: 'Weakest Beast Tamer',
+    status: {
+      scripting: { current: 24, total: 50 },
+      raw: { current: 18, total: 50 },
+      mastering: { current: 12, total: 50 },
+      creativeQC: { current: 8, total: 50 },
+      technicalQC: { current: 5, total: 50 },
+    },
+    activePillar: 'raw',
+  },
+  {
+    id: 'ps-2',
+    showName: 'Infinite Mana in the Apocalypse',
+    status: {
+      scripting: { current: 50, total: 50 },
+      raw: { current: 42, total: 50 },
+      mastering: { current: 38, total: 50 },
+      creativeQC: { current: 30, total: 50 },
+      technicalQC: { current: 28, total: 50 },
+    },
+    activePillar: 'creativeQC',
+  },
+  {
+    id: 'ps-3',
+    showName: 'Voiceover Masters',
+    status: {
+      scripting: { current: 12, total: 24 },
+      raw: { current: 10, total: 24 },
+      mastering: { current: 6, total: 24 },
+      creativeQC: { current: 4, total: 24 },
+      technicalQC: { current: 2, total: 24 },
+    },
+    activePillar: null,
+  },
+  {
+    id: 'ps-4',
+    showName: 'Podcast Hour',
+    status: {
+      scripting: { current: 8, total: 20 },
+      raw: { current: 5, total: 20 },
+      mastering: { current: 2, total: 20 },
+      creativeQC: { current: 0, total: 20 },
+      technicalQC: { current: 0, total: 20 },
+    },
+    activePillar: 'mastering',
+  },
+];
+
 export interface AdminTableRow {
   id: string;
   producerName: string;

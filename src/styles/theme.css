@@ -1,5 +1,30 @@
 @custom-variant dark (&:is(.dark *));
 
+/* Wavesurfer Regions: grabbable vertical handles (trackpad/mouse-friendly) */
+[part~="region-handle"] {
+  width: 14px !important;
+  min-width: 14px !important;
+  background: rgba(255, 255, 255, 0.9) !important;
+  cursor: ew-resize !important;
+  border-radius: 2px;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+[data-region] [data-handle],
+.wavesurfer-handle {
+  width: 14px !important;
+  min-width: 14px !important;
+  background: rgba(255, 255, 255, 0.9) !important;
+  cursor: ew-resize !important;
+  border-radius: 2px;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
+}
+[data-region] {
+  cursor: grab;
+}
+[data-region]:active {
+  cursor: grabbing;
+}
+
 :root {
   --font-size: 16px;
   --background: #ffffff;

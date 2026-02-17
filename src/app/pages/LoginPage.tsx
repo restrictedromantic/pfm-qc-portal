@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router';
 import { useAuth } from '../context/AuthContext';
 import { LogIn } from 'lucide-react';
@@ -12,9 +12,14 @@ export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  if (user) {
+  // Redirect when already logged in – must run in useEffect to avoid "Cannot update a component while rendering another"
+  useEffect(() => {
+    if (!user) return;
     const from = (location.state as { from?: { pathname: string } })?.from?.pathname ?? '/';
     navigate(from, { replace: true });
+  }, [user, location.state, navigate]);
+
+  if (user) {
     return null;
   }
 

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
 
 const HARDCODED_USERS = [
   { email: 'admin@pocketfm.com', isAdmin: true },
@@ -23,17 +23,20 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 const STORAGE_KEY = 'qc-dashboard-user';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => {
+  const [user, setUser] = useState<User | null>(null);
+
+  // Restore session in useEffect to avoid setState during another component's render
+  useEffect(() => {
     try {
       const stored = sessionStorage.getItem(STORAGE_KEY);
-      if (!stored) return null;
+      if (!stored) return;
       const parsed = JSON.parse(stored) as User;
       const found = HARDCODED_USERS.find((u) => u.email === parsed.email);
-      return found ? { email: found.email, isAdmin: found.isAdmin } : null;
+      if (found) setUser({ email: found.email, isAdmin: found.isAdmin });
     } catch {
-      return null;
+      // ignore
     }
-  });
+  }, []);
 
   const login = useCallback((email: string) => {
     const normalized = email.trim().toLowerCase();
